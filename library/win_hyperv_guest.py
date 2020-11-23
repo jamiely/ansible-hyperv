@@ -56,9 +56,26 @@ options:
       - Specifies the generation of the VM
     required: false
     default: 2
+  enable_secure_boot:
+    description:
+      - |
+        Whether or not to enable secure boot. For Linux VMs
+        we typically disable this.
+    required: false
+    default: false
+  use_static_mac:
+    description:
+      - Whether to use a static mac address
+    required: false
+    default: false
   network_switch:
     description:
       - Specifies a network adapter for the VM
+    required: false
+    default: null
+  vlan_id:
+    description:
+      - Specifies the vlan id that the VM should be connected to
     required: false
     default: null
   diskpath:

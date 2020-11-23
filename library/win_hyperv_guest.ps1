@@ -29,14 +29,32 @@ $memory = Get-Attr -obj $params -name memory -default '512MB'
 $hostserver = Get-Attr -obj $params -name hostserver
 $generation = Get-Attr -obj $params -name generation -default 2
 $network_switch = Get-Attr -obj $params -name network_switch -default $null
-
+$enable_secure_boot = Get-Attr -obj $params -name enable_secure_boot -default "false" | ConvertTo-Bool
+$vlan_id = Get-Attr -obj $params -name vlan_id
+$use_static_mac = Get-Attr -obj $params -name use_static_mac -default "false" | ConvertTo-Bool
+$vmdir = Get-Attr -obj $params -name dir -default $null
 $diskpath = Get-Attr -obj $params -name diskpath -default $null
 
 $showlog = Get-Attr -obj $params -name showlog -default "false" | ConvertTo-Bool
 $state = Get-Attr -obj $params -name state -default "present"
 
+$secondary_vlan_id = Get-Attr -obj $params -name secondary_vlan_id
+
 if ("poweroff", "present","absent","started","stopped" -notcontains $state) {
   Fail-Json $result "The state: $state doesn't exist; State can only be: present, absent, started or stopped"
+}
+
+Function BoolToOnOff($bool) {
+  if($bool) {
+    return "On"
+  }
+
+  return "Off"
+}
+
+# https://community.idera.com/database-tools/powershell/powertips/b/tips/posts/creating-random-mac-addresses
+Function GenerateRandomMacAddress {
+  return [BitConverter]::ToString([BitConverter]::GetBytes((Get-Random -Maximum 0xFFFFFFFFFFFF)), 0, 6).Replace('-', ':')
 }
 
 Function VM-Create {
@@ -62,6 +80,10 @@ Function VM-Create {
       $cmd += " -SwitchName '$network_switch'"
     }
 
+    if ($vmdir) {
+      $cmd += " -Path '$vmdir'"
+    }
+
     if ($diskpath) {
       #If VHD already exists then attach it, if not create it
       if (Test-Path $diskpath) {
@@ -74,6 +96,24 @@ Function VM-Create {
       # Need to chain these
       $results = invoke-expression $cmd
       $results = invoke-expression "Set-VMProcessor $name -Count $cpu"
+      # setup the first network
+      if($vlan_id) {
+        $results = invoke-expression "Set-VMNetworkAdapterVlan -VMName $name -Access -VlanId $vlan_id"
+      }
+      if($use_static_mac) {
+        $mac_address = GenerateRandomMacAddress
+        $results = invoke-expression "Set-VMNetworkAdapter -VMName $name -StaticMacAddress $mac_address"
+      }
+
+      # for the second adapter, we don't care about a static mac.
+      if($secondary_vlan_id) {
+        $adapter_name = "Secondary Network Adapter"
+        $results = invoke-expression "Add-VMNetworkAdapter -VMName $name -Name '$adapter_name' -SwitchName '$network_switch'"
+        $results = invoke-expression "Set-VMNetworkAdapterVlan -VMName $name -VMNetworkAdapterName '$adapter_name' -Access -VlanId $secondary_vlan_id"
+      }
+
+      $results = Invoke-Expression "Set-VMFirmware $name -EnableSecureBoot $(BoolToOnOff $enable_secure_boot)"
+
 
       $result.changed = $true
       } else {
