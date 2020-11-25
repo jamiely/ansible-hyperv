@@ -40,6 +40,8 @@ $state = Get-Attr -obj $params -name state -default "present"
 
 $secondary_vlan_id = Get-Attr -obj $params -name secondary_vlan_id
 
+$IPV4_REGEX = '^(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$'
+
 if ("poweroff", "present","absent","started","stopped" -notcontains $state) {
   Fail-Json $result "The state: $state doesn't exist; State can only be: present, absent, started or stopped"
 }
@@ -61,124 +63,171 @@ Function VM-Create {
   #Check If the VM already exists
   $CheckVM = Get-VM -name $name -ErrorAction SilentlyContinue
 
-  if (!$CheckVM) {
-    $cmd = "New-VM -Name $name"
+  if($CheckVM) {
+    $result.vm = VM-GetSummary($CheckVM)
+    return
+  }
 
-    if ($memory) {
-      $cmd += " -MemoryStartupBytes $memory"
+  $cmd = "New-VM -Name $name"
+
+  if ($memory) {
+    $cmd += " -MemoryStartupBytes $memory"
+  }
+
+  if ($hostserver) {
+    $cmd += " -ComputerName $hostserver"
+  }
+
+  if ($generation) {
+    $cmd += " -Generation $generation"
+  }
+
+  if ($network_switch) {
+    $cmd += " -SwitchName '$network_switch'"
+  }
+
+  if ($vmdir) {
+    $cmd += " -Path '$vmdir'"
+  }
+
+  if ($diskpath) {
+    #If VHD already exists then attach it, if not create it
+    if (Test-Path $diskpath) {
+      $cmd += " -VHDPath '$diskpath'"
+    } else {
+      $cmd += " -NewVHDPath '$diskpath'"
     }
+  }
 
-    if ($hostserver) {
-      $cmd += " -ComputerName $hostserver"
-    }
+  # Need to chain these
+  $results = invoke-expression $cmd
+  $results = invoke-expression "Set-VMProcessor $name -Count $cpu"
+  # setup the first network
+  if($vlan_id) {
+    $results = invoke-expression "Set-VMNetworkAdapterVlan -VMName $name -Access -VlanId $vlan_id"
+  }
+  if($use_static_mac) {
+    $mac_address = GenerateRandomMacAddress
+    $results = invoke-expression "Set-VMNetworkAdapter -VMName $name -StaticMacAddress $mac_address"
+  }
 
-    if ($generation) {
-      $cmd += " -Generation $generation"
-    }
+  # for the second adapter, we don't care about a static mac.
+  if($secondary_vlan_id) {
+    $adapter_name = "Secondary Network Adapter"
+    $results = invoke-expression "Add-VMNetworkAdapter -VMName $name -Name '$adapter_name' -SwitchName '$network_switch'"
+    $results = invoke-expression "Set-VMNetworkAdapterVlan -VMName $name -VMNetworkAdapterName '$adapter_name' -Access -VlanId $secondary_vlan_id"
+  }
 
-    if ($network_switch) {
-      $cmd += " -SwitchName '$network_switch'"
-    }
+  $results = Invoke-Expression "Set-VMFirmware $name -EnableSecureBoot $(BoolToOnOff $enable_secure_boot)"
 
-    if ($vmdir) {
-      $cmd += " -Path '$vmdir'"
-    }
+  $result.changed = $true
+  $result.vm = VM-GetSummary($CheckVM)
+}
 
-    if ($diskpath) {
-      #If VHD already exists then attach it, if not create it
-      if (Test-Path $diskpath) {
-        $cmd += " -VHDPath '$diskpath'"
-        } else {
-          $cmd += " -NewVHDPath '$diskpath'"
-        }
-      }
+Function VM-Delete {
+  $CheckVM = Get-VM -name $name -ErrorAction SilentlyContinue
 
-      # Need to chain these
+  if ($CheckVM) {
+    $cmd="Remove-VM -Name $name -Force"
+    $results = invoke-expression $cmd
+    $result.changed = $true
+  } else {
+    $result.changed = $false
+  }
+}
+
+Function VM-Start {
+  $CheckVM = Get-VM -name $name -ErrorAction SilentlyContinue
+
+  if ($CheckVM) {
+    if($CheckVM.state -Match "Running") {
+      $result.vm = VM-GetSummary($CheckVM)
+      $result.changed = $false
+    } else {
+      $cmd="Start-VM -Name $name"
       $results = invoke-expression $cmd
-      $results = invoke-expression "Set-VMProcessor $name -Count $cpu"
-      # setup the first network
-      if($vlan_id) {
-        $results = invoke-expression "Set-VMNetworkAdapterVlan -VMName $name -Access -VlanId $vlan_id"
-      }
-      if($use_static_mac) {
-        $mac_address = GenerateRandomMacAddress
-        $results = invoke-expression "Set-VMNetworkAdapter -VMName $name -StaticMacAddress $mac_address"
-      }
-
-      # for the second adapter, we don't care about a static mac.
-      if($secondary_vlan_id) {
-        $adapter_name = "Secondary Network Adapter"
-        $results = invoke-expression "Add-VMNetworkAdapter -VMName $name -Name '$adapter_name' -SwitchName '$network_switch'"
-        $results = invoke-expression "Set-VMNetworkAdapterVlan -VMName $name -VMNetworkAdapterName '$adapter_name' -Access -VlanId $secondary_vlan_id"
-      }
-
-      $results = Invoke-Expression "Set-VMFirmware $name -EnableSecureBoot $(BoolToOnOff $enable_secure_boot)"
-
-
       $result.changed = $true
-      } else {
-        $result.changed = $false
-      }
+      # Get the updated result
+      $CheckVM = Get-VM -name $name -ErrorAction SilentlyContinue
+      $result.vm = VM-GetSummary($CheckVM)
     }
+  } else {
+    Fail-Json $result "The VM: $name; Doesn't exists please create the VM first"
+  }
+}
 
-    Function VM-Delete {
-      $CheckVM = Get-VM -name $name -ErrorAction SilentlyContinue
+Function VM-GetSummary($vm) {
+  $adapters = @($vm.NetworkAdapters `
+    | ForEach-Object { VM-GetNetworkAdapterSummary $_ })
 
-      if ($CheckVM) {
-        $cmd="Remove-VM -Name $name -Force"
-        $results = invoke-expression $cmd
-        $result.changed = $true
-        } else {
-         $result.changed = $false
-       }
-     }
+  return @{
+    Name = $vm.name;
+    State = $vm.state;
+    CPUUsagePct = $vm.CPUUsage;
+    MemoryAssignedBytes = $vm.MemoryAssigned;
+    UptimeSeconds = $vm.Uptime.TotalSeconds;
+    Status = $vm.Status;
+    Version = $vm.Version;
+    NetworkAdapters = $adapters;
 
-     Function VM-Start {
-      $CheckVM = Get-VM -name $name -ErrorAction SilentlyContinue
+    IPAddressesV4 = @($vm.NetworkAdapters `
+      | Select-Object -Expand IpAddresses `
+      | Where-Object {$_ -Match $IPV4_REGEX});
+  }
+}
 
-      if ($CheckVM) {
-        $cmd="Start-VM -Name $name"
-        $results = invoke-expression $cmd
-        $result.changed = $true
-        } else {
-         Fail-Json $result "The VM: $name; Doesn't exists please create the VM first"
-       }
-     }
+Function VM-GetNetworkAdapterSummary($adapter) {
+  return @{
+    Name = $adapter.Name;
+    Switch = $adapter.SwitchName;
+    MacAddress = $adapter.MacAddress;
+    IpAddresses = $adapter.IPAddresses;
+    IpAddressesV4 = @($adapter.IPAddresses `
+      | Where-Object {$_ -Match $IPV4_REGEX});
+  }
+}
 
-     Function VM-Poweroff {
-      $CheckVM = Get-VM -name $name -ErrorAction SilentlyContinue
+Function VM-Poweroff {
+  $CheckVM = Get-VM -name $name -ErrorAction SilentlyContinue
+  $ignore_existence = Get-Attr -obj $params -name ignore_existence -default "true" | ConvertTo-Bool
 
-      if ($CheckVM) {
-        $cmd="Stop-VM -Name $name -TurnOff"
-        $results = invoke-expression $cmd
-        $result.changed = $true
-        } else {
-         Fail-Json $result "The VM: $name; Doesn't exists please create the VM first"
-       }
-     }
+  if (! $CheckVM) {
+    $result.changed = $false
+    if($ignore_existence) {
+      $result.warning = "The VM didn't exist"
+    } else {
+      Fail-Json $result "The VM: $name; Doesn't exists please create the VM first"
+    }
+    return
+  }
 
-     Function VM-Shutdown {
-      $CheckVM = Get-VM -name $name -ErrorAction SilentlyContinue
+  $cmd="Stop-VM -Name $name -TurnOff"
+  $results = invoke-expression $cmd
+  $result.changed = $true
+}
 
-      if ($CheckVM) {
-        $cmd="Stop-VM -Name $name"
-        $results = invoke-expression $cmd
-        $result.changed = $true
-        } else {
-         Fail-Json $result "The VM: $name; Doesn't exists please create the VM first"
-       }
-     }
+Function VM-Shutdown {
+$CheckVM = Get-VM -name $name -ErrorAction SilentlyContinue
 
-     Try {
-      switch ($state) {
-        "present" {VM-Create}
-        "absent" {VM-Delete}
-        "started" {VM-Start}
-        "stopped" {VM-Shutdown}
-        "poweroff" {VM-Poweroff}
-      }
+  if ($CheckVM) {
+    $cmd="Stop-VM -Name $name"
+    $results = invoke-expression $cmd
+    $result.changed = $true
+  } else {
+    Fail-Json $result "The VM: $name; Doesn't exists please create the VM first"
+  }
+}
 
-      Exit-Json $result;
-      } Catch {
-        Fail-Json $result $_.Exception.Message
-      }
+Try {
+  switch ($state) {
+    "present" {VM-Create}
+    "absent" {VM-Delete}
+    "started" {VM-Start}
+    "stopped" {VM-Shutdown}
+    "poweroff" {VM-Poweroff}
+  }
+
+  Exit-Json $result;
+} Catch {
+  Fail-Json $result $_.Exception.Message
+}

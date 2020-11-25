@@ -84,6 +84,13 @@ options:
 	  - If the file exists it will be attached, if not then a new one will be created
     require: false
     default: null
+  ignore_existence:
+    description:
+      - |
+        Whether to ignore VMs that don't exist or raise
+        an error for state power-off.
+    require: false
+    default: true
 '''
 
 EXAMPLES = '''
